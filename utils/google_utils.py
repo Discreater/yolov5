@@ -21,6 +21,7 @@ def attempt_download(file, repo='ultralytics/yolov5'):
     file = Path(str(file).strip().replace("'", '').lower())
 
     if not file.exists():
+        print("downloading...")
         try:
             response = requests.get(f'https://api.github.com/repos/{repo}/releases/latest').json()  # github api
             assets = [x['name'] for x in response['assets']]  # release assets, i.e. ['yolov5s.pt', 'yolov5m.pt', ...]
