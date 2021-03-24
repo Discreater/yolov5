@@ -292,7 +292,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            with amp.autocast(enabled=cuda):
+            with amp.autocast(enabled=False):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if rank != -1:
@@ -473,6 +473,7 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
+    parser.add_argument('--no-wandb', action='store_true', help='do not use wandb')
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -517,12 +518,15 @@ if __name__ == '__main__':
 
     # Train
     logger.info(opt)
-    try:
-        import wandb
-    except ImportError:
+    if not opt.no_wandb:
+        try:
+            import wandb
+        except ImportError:
+            wandb = None
+            prefix = colorstr('wandb: ')
+            logger.info(f"{prefix}Install Weights & Biases for YOLOv5 logging with 'pip install wandb' (recommended)")
+    else:
         wandb = None
-        prefix = colorstr('wandb: ')
-        logger.info(f"{prefix}Install Weights & Biases for YOLOv5 logging with 'pip install wandb' (recommended)")
     if not opt.evolve:
         tb_writer = None  # init loggers
         if opt.global_rank in [-1, 0]:
