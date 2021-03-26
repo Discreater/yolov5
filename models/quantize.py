@@ -61,6 +61,22 @@ class Conv2dQ(nn.Conv2d):
         return output
 
 
+class ActQ(nn.Module):
+    def __init__(self, a_bit=8):
+        super(ActQ, self).__init__()
+        assert a_bit <= 8 or a_bit == 32
+        self.a_bit = a_bit
+        self.uniform_q = ActivationQuantize(a_bits=a_bit, clamp=False)
+
+    def forward(self, x):
+        if self.a_bit == 32:
+            activation_q = torch.clamp(x, 0, 6)
+        else:
+            activation_q = self.uniform_q(torch.clamp(x, 0, 1))
+            # print(np.unique(activation_q.detach().numpy()))
+        return activation_q
+
+
 def reshape_to_activation(x):
     return x.reshape(1, -1, 1, 1)
 
@@ -237,7 +253,7 @@ class WeightQuantize(nn.Module):
 
 
 class ActivationQuantize(nn.Module):
-    def __init__(self, a_bits, clamp=True):
+    def __init__(self, a_bits, clamp=False):
         super().__init__()
         self.a_bits = a_bits
         self.clamp = clamp
