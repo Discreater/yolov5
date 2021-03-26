@@ -73,35 +73,13 @@ def reshape_to_bias(x):
     return x.reshape(-1)
 
 
-def uniform_quantize(bits):
-    class QuantizeFn(torch.autograd.Function):
-
-        @staticmethod
-        def forward(ctx, x):
-            if bits == 32:
-                out = x
-            elif bits == 1:
-                out = torch.sign(x)
-            else:
-                n = float(2 ** bits - 1)
-                out = torch.round(x * n) / n
-            return out
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            grad_input = grad_output.clone()
-            return grad_input
-
-    return QuantizeFn().apply
-
-
 class BatchNorm2dQ(nn.BatchNorm2d):
     def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True,
                  track_running_stats=True, w_bit=8):
         super(BatchNorm2dQ, self).__init__(num_features, eps, momentum, affine,
                                            track_running_stats)
         self.w_bit = w_bit
-        self.quantize_fn = uniform_quantize(bits=w_bit)
+        self.quantize_fn = ActivationQuantize(a_bits=w_bit, clamp=False)
 
     def extra_repr(self):
         s = super(BatchNorm2dQ, self).extra_repr()
@@ -259,9 +237,10 @@ class WeightQuantize(nn.Module):
 
 
 class ActivationQuantize(nn.Module):
-    def __init__(self, a_bits):
+    def __init__(self, a_bits, clamp=True):
         super().__init__()
         self.a_bits = a_bits
+        self.clamp = clamp
 
     def extra_repr(self) -> str:
         s = 'a_bits={}'.format(self.a_bits)
@@ -278,7 +257,10 @@ class ActivationQuantize(nn.Module):
         elif self.a_bits == 1:
             output = torch.sign(x)
         else:
-            output = torch.clamp(x * 0.1, 0, 1)  # 特征A截断前先进行缩放（* 0.1），以减小截断误差
+            if self.clamp:
+                output = torch.clamp(x * 0.1, 0, 1)  # 特征A截断前先进行缩放（* 0.1），以减小截断误差
+            else:
+                output = x
             scale = float(2 ** self.a_bits - 1)
             output = output * scale
             output = self.round(output)
