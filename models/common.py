@@ -9,11 +9,11 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
+from models import quantize
 from utils.datasets import letterbox
 from utils.general import non_max_suppression, make_divisible, scale_coords, xyxy2xywh
 from utils.plots import color_list, plot_one_box
 from utils.torch_utils import time_synchronized
-from models import quantize
 
 
 def autopad(k, p=None):  # kernel, padding
@@ -32,9 +32,10 @@ class Conv(nn.Module):
     # Standard convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
-        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, w_bits=4, w_signed=True)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        # self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = quantize.ActivationQuantize(a_bits=4, scale=1, l_shift=4)  # -> (0,1)
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -279,7 +280,7 @@ class Detections:
     def print(self):
         self.display(pprint=True)  # print results
         print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' %
-              tuple(self.t))                      
+              tuple(self.t))
 
     def show(self):
         self.display(show=True)  # show results

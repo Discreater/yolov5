@@ -15,6 +15,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
+from models import quantize
+
 try:
     import thop  # for FLOPS computation
 except ImportError:
@@ -169,27 +171,72 @@ def prune(model, amount=0.3):
     print(' %.3g global sparsity' % sparsity(model))
 
 
-def fuse_conv_and_bn(conv, bn):
+def fuse_conv_and_bn(m):
+    conv = m.conv
+    bn = m.bn
     # Fuse convolution and batchnorm layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/
-    fusedconv = nn.Conv2d(conv.in_channels,
-                          conv.out_channels,
-                          kernel_size=conv.kernel_size,
-                          stride=conv.stride,
-                          padding=conv.padding,
-                          groups=conv.groups,
-                          bias=True).requires_grad_(False).to(conv.weight.device)
+    if isinstance(conv, quantize.Conv2dQ):
+        fuse_quantized_conv_and_bn(m)
+        return
+    fused_conv = nn.Conv2d(conv.in_channels,
+                           conv.out_channels,
+                           kernel_size=conv.kernel_size,
+                           stride=conv.stride,
+                           padding=conv.padding,
+                           groups=conv.groups,
+                           bias=True).requires_grad_(False).to(conv.weight.device)
 
     # prepare filters
     w_conv = conv.weight.clone().view(conv.out_channels, -1)
     w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-    fusedconv.weight.copy_(torch.mm(w_bn, w_conv).view(fusedconv.weight.size()))
+    fused_conv.weight.copy_(torch.mm(w_bn, w_conv).view(fused_conv.weight.size()))
 
     # prepare spatial bias
     b_conv = torch.zeros(conv.weight.size(0), device=conv.weight.device) if conv.bias is None else conv.bias
     b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-    fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+    fused_conv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
-    return fusedconv
+    m.conv = fused_conv
+    delattr(m, 'bn')  # remove batchnorm
+    m.forward = m.fuseforward  # update forward
+
+
+def fuse_quantized_conv_and_bn(m, first_layer=False, last_layer=False):
+    conv = m.conv
+    bn = m.bn
+    fused_conv = quantize.Conv2dQ(conv.in_channels,
+                                  conv.out_channels,
+                                  kernel_size=conv.kernel_size,
+                                  stride=conv.stride,
+                                  padding=conv.padding,
+                                  groups=conv.groups,
+                                  bias=True,
+                                  w_bits=conv.bits).requires_grad_(False).to(conv.weight.device)
+
+    w_conv = quantize.quantize_weight(conv.weight.clone(), bits=conv.w_bits)
+    fused_conv.weight.int().copy_(w_conv)
+
+    gamma = bn.weight.detach()
+    beta = bn.weight.bias.detach()
+    running_mean = bn.running_mean.detach()
+    running_var = bn.running_var.detach()
+    eps = bn.eps
+
+    in_bit = 4 if not first_layer else 8
+    out_bit = 4 if not last_layer else 32
+
+    inc, bias = quantize.quantize_bn(gamma, beta, running_mean, running_var, eps, w_bit=conv.w_bits, in_bit=in_bit,
+                                     out_bit=out_bit,
+                                     l_shift=m.act.l_shift)
+
+    act = quantize.FusedBnAct(conv.out_channels, w_bit=conv.w_bits, data_bit=in_bit, l_shift=m.act.l_shift)
+    act.weight.int().copy_(inc)
+    act.bias.int().copy_(bias)
+
+    m.conv = fused_conv
+    m.act = act
+    delattr(m, 'bn')  # remove batchnorm
+    m.forward = m.fuseforward  # update forward
 
 
 def model_info(model, verbose=False, img_size=640):

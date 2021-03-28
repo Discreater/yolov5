@@ -15,10 +15,9 @@ class Conv2dQ(nn.Conv2d):
             dilation=1,
             groups=1,
             bias=True,
-            padding_mode: str=  "zeros",
-            a_bits=8,
-            w_bits=8,
-            first_layer=False
+            padding_mode: str = "zeros",
+            w_bits: int = 8,
+            w_signed: bool = False,
     ):
         super().__init__(
             in_channels=in_channels,
@@ -32,19 +31,21 @@ class Conv2dQ(nn.Conv2d):
             padding_mode=padding_mode,
         )
         # 实例化调用A和W量化器
-        self.activation_quantizer = ActivationQuantize(a_bits=a_bits)
-        self.weight_quantizer = WeightQuantize(w_bits=w_bits)
-        self.first_layer = first_layer
+        self.w_bits = w_bits
+        self.w_signed = w_signed
+        self.weight_quantizer = WeightQuantize(bits=w_bits, signed=w_signed)
+
+    def extra_repr(self):
+        s = super(Conv2dQ, self).extra_repr()
+        s += ", w_bits={}, w_signed={}".format(self.w_bits, self.w_signed)
+        return s
 
     def forward(self, x):
-        # 量化A和W
-        if not self.first_layer:
-            x = self.activation_quantizer(x)
-        q_input = x
+        # quantize weight
         q_weight = self.weight_quantizer(self.weight)
-        # 量化卷积
+
         output = F.conv2d(
-            input=q_input,
+            input=x,
             weight=q_weight,
             bias=self.bias,
             stride=self.stride,
@@ -56,34 +57,59 @@ class Conv2dQ(nn.Conv2d):
 
 
 class WeightQuantize(nn.Module):
-    def __init__(self, w_bits):
+    bits: int
+
+    def __init__(self, bits, signed=False):
         super().__init__()
-        self.w_bits = w_bits
+        self.bits = bits
+        self.signed = signed
 
     def round(self, x):
         output = Round.apply(x)
         return output
 
     def forward(self, x):
-        assert self.w_bits != 1, '！Binary quantization is not supported ！'
-        if self.w_bits == 32:
-            output = x
+        assert self.bits != 1, '！Binary quantization is not supported ！'
+        if self.bits == 32:
+            output = torch.tanh(x)
+            output = output / torch.max(torch.abs(output))
         else:
             # 按照公式9和10计算
             output = torch.tanh(x)
-            output = output / 2 / torch.max(torch.abs(output)) + 0.5  # 归一化-[0,1]
-            scale = float(2 ** self.w_bits - 1)
+
+            if not self.signed:
+                output = output / 2 / torch.max(torch.abs(output)) + 0.5  # -> [0,1]
+                scale = float(2 ** self.bits)
+            else:
+                output = output / torch.max(torch.abs(output))  # -> [-1, 1]
+                scale = float(2 ** self.bits - 1)
+
+            # quantize
             output = output * scale
             output = self.round(output)
             output = output / scale
-            output = 2 * output - 1
+
+            if not self.signed:
+                output = 2 * output - 1
         return output
 
 
 class ActivationQuantize(nn.Module):
-    def __init__(self, a_bits):
+    def __init__(self, a_bits, scale=1, l_shift=4):
+        """
+        Args:
+            a_bits (int): 量化位数
+            scale (int): 截断前放缩系数
+        """
         super().__init__()
+        assert scale == 1
         self.a_bits = a_bits
+        self.scale = scale
+        self.l_shift = l_shift
+
+    def extra_repr(self) -> str:
+        s = "a_bits={}, scale={}".format(self.a_bits, self.scale)
+        return s
 
     def round(self, x):
         output = Round.apply(x)
@@ -92,14 +118,38 @@ class ActivationQuantize(nn.Module):
     def forward(self, x):
         assert self.a_bits != 1, '！Binary quantization is not supported ！'
         if self.a_bits == 32:
-            output = x
+            output = torch.clamp(x, 0, 6)  # ReLU6
         else:
-            output = torch.clamp(x * 0.1, 0, 1)  # 特征A截断前先进行缩放（* 0.1），以减小截断误差
+            output = torch.clamp(x * self.scale, 0, 1)  # 特征A截断前先进行缩放（* scale），以减小截断误差
             scale = float(2 ** self.a_bits - 1)
             output = output * scale
             output = self.round(output)
             output = output / scale
         return output
+
+
+class FusedBnAct(nn.Module):
+    def __init__(self, ch, w_bit, data_bit, l_shift, signed=True):
+        super(FusedBnAct, self).__init__()
+        assert signed
+        self.weight = torch.Tensor(ch)
+        self.bias = torch.Tensor(ch)
+        self.w_bit = w_bit
+        self.data_bit = data_bit
+        self.l_shift = l_shift
+
+    def extra_repr(self) -> str:
+        s = "w_bit={}, data_bit={}, l_shift={}".format(self.w_bit, self.data_bit, self.l_shift)
+        return s
+
+    def forward(self, x):
+        assert not self.training
+        d = 1 << (self.w_bit - 1 + self.data_bit + self.l_shift)
+        x = x * self.weight + self.bias
+        x = torch.clamp(x, 0)
+        x = (x + (d >> 1)) >> (self.w_bit - 1 + self.data_bit + self.l_shift)
+        x = torch.clamp(x, max=15)  # 15 ?
+        return x
 
 
 class Round(Function):
@@ -113,3 +163,32 @@ class Round(Function):
     def backward(self, grad_output):
         grad_input = grad_output.clone()
         return grad_input
+
+
+def fuse_bn(gamma, beta, mean, var, eps):
+    w = gamma / (torch.sqrt(var + eps))
+    b = beta - w * mean
+    return w, b
+
+
+def quantize_bn(gamma, beta, mean, var, eps, w_bit, in_bit, out_bit, l_shift, signed=True):
+    assert signed
+    w, b = fuse_bn(gamma, beta, mean, var, eps)
+
+    n = (1 << (w_bit - 1 + in_bit + l_shift)) / (((1 << (w_bit - 1)) - 1) * ((1 << in_bit) - 1))
+    inc_q_float = (((1 << out_bit) - 1) * n * w)
+    bias_q_float = ((1 << (w_bit - 1)) - 1) * ((1 << in_bit - 1) * ((1 << out_bit) - 1) * n * b)
+    inc_q = inc_q_float.round().int()
+    bias_q = bias_q_float.round().int()
+    print('inc_q: {}'.format(inc_q))
+    print('bias_q: {}'.format(bias_q))
+    return inc_q, bias_q
+
+
+def quantize_weight(x, bits, signed=True):
+    assert signed
+    x = torch.tanh(x)
+    x = x / torch.max(torch.abs(x))
+    x_q = x * ((1 << (bits - 1)) - 1)
+    x_q = torch.round(x_q).int()
+    return x_q

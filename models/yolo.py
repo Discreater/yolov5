@@ -166,9 +166,7 @@ class Model(nn.Module):
         print('Fusing layers... ')
         for m in self.model.modules():
             if type(m) is Conv and hasattr(m, 'bn'):
-                m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
-                delattr(m, 'bn')  # remove batchnorm
-                m.forward = m.fuseforward  # update forward
+                fuse_conv_and_bn(m)  # update conv
         self.info()
         return self
 
