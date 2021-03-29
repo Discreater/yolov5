@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
+from torch.nn import Parameter
 
 
 class Conv2dQ(nn.Conv2d):
@@ -17,7 +18,7 @@ class Conv2dQ(nn.Conv2d):
             bias=True,
             padding_mode: str = "zeros",
             w_bits: int = 4,
-            w_signed: bool = False,
+            w_signed: bool = True,
     ):
         super().__init__(
             in_channels=in_channels,
@@ -47,6 +48,18 @@ class Conv2dQ(nn.Conv2d):
         output = F.conv2d(
             input=x,
             weight=q_weight,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
+        )
+        return output
+
+    def fused_forward(self, x):
+        output = F.conv2d(
+            input=x,
+            weight=self.weight,
             bias=self.bias,
             stride=self.stride,
             padding=self.padding,
@@ -126,27 +139,30 @@ class ActivationQuantize(nn.Module):
         return output
 
 
-class FusedBnAct(nn.Module):
-    def __init__(self, ch, w_bit, data_bit, scale_shift, signed=True):
-        super(FusedBnAct, self).__init__()
+class BnActFused(nn.Module):
+    def __init__(self, ch, w_bit, in_bit, out_bit, scale_shift, signed=True):
+        super(BnActFused, self).__init__()
         assert signed
+        self.ch = ch
         self.weight = torch.Tensor(ch)
         self.bias = torch.Tensor(ch)
         self.w_bit = w_bit
-        self.data_bit = data_bit
+        self.in_bit = in_bit
+        self.out_bit = out_bit
         self.scale_shift = scale_shift
+        self.signed = signed
 
     def extra_repr(self) -> str:
-        s = "w_bit={}, data_bit={}, scale_shift={}".format(self.w_bit, self.data_bit, self.scale_shift)
+        s = "ch={}, w_bit={}, in_bit={}, out_bit={}, scale_shift={}, signed={}".format(self.ch, self.w_bit, self.in_bit,
+                                                                                       self.out_bit, self.scale_shift,
+                                                                                       self.signed)
         return s
 
     def forward(self, x):
         assert not self.training
-        d = 1 << (self.w_bit - 1 + self.data_bit + self.scale_shift)
         x = x * self.weight + self.bias
-        x = torch.clamp(x, 0)
-        x = (x + (d >> 1)) >> (self.w_bit - 1 + self.data_bit + self.scale_shift)
-        x = torch.clamp(x, max=15)  # 15 ?
+        x = x >> (self.w_bit - 1 + self.in_bit + self.scale_shift)
+        x = torch.clamp(x, min=0, max=((1 << self.out_bit) - 1))
         return x
 
 
@@ -173,9 +189,9 @@ def quantize_bn(gamma, beta, mean, var, eps, w_bit, in_bit, out_bit, scale_shift
     assert signed
     w, b = fuse_bn(gamma, beta, mean, var, eps)
 
-    n = (1 << (w_bit - 1 + in_bit + scale_shift)) / (((1 << (w_bit - 1)) - 1) * ((1 << in_bit) - 1))
-    inc_q_float = (((1 << out_bit) - 1) * n * w)
-    bias_q_float = ((1 << (w_bit - 1)) - 1) * ((1 << in_bit - 1) * ((1 << out_bit) - 1) * n * b)
+    # n = (1 << (w_bit - 1 + in_bit + scale_shift)) / (((1 << (w_bit - 1)) - 1) * ((1 << in_bit) - 1))
+    inc_q_float = (((1 << out_bit) - 1) * w)
+    bias_q_float = ((1 << (w_bit - 1)) - 1) * ((1 << in_bit - 1) * ((1 << out_bit) - 1) * b)
     inc_q = inc_q_float.round().int()
     bias_q = bias_q_float.round().int()
     print('inc_q: {}'.format(inc_q))

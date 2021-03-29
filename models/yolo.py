@@ -33,7 +33,7 @@ class Detect(nn.Module):
         a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
-        self.m = nn.ModuleList(quantize.Conv2dQ(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.m = nn.ModuleList(quantize.Conv2dQ(x, self.no * self.na, 1, w_bits=32) for x in ch)  # output conv
 
     def forward(self, x):
         # x = x.copy()  # for profiling
@@ -165,8 +165,11 @@ class Model(nn.Module):
     def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
         print('Fusing layers... ')
         for m in self.model.modules():
-            if type(m) is Conv and hasattr(m, 'bn'):
-                fuse_conv_and_bn(m)  # update conv
+            if isinstance(m, Conv) and hasattr(m, 'bn'):
+                if isinstance(m.conv, nn.Conv2d):
+                    fuse_conv_and_bn(m)  # update conv
+                else:
+                    m.fuse()  # quantized Conv2d
         self.info()
         return self
 
@@ -194,14 +197,20 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
+def parse_model(model_dict, ch):
+    """
+    :param model_dict: model_dict
+    :param ch: input_channels
+    """
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
-    anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
+    anchors = model_dict['anchors']
+    nc = model_dict['nc']
+    gd, gw = model_dict['depth_multiple'], model_dict['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+    for i, (f, n, m, args) in enumerate(model_dict['backbone'] + model_dict['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             try:

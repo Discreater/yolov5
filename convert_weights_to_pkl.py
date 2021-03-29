@@ -6,7 +6,7 @@ import pickle
 import numpy as np
 import torch.nn as nn
 
-from models import experimental, common, yolo
+from models import experimental, common, yolo, quantize
 
 
 def save_model(module: nn.Module):
@@ -27,6 +27,19 @@ def save_model(module: nn.Module):
             "args": str(module),
             "weight": module.weight.data.cpu().numpy(),
             "bias": module.bias.data.cpu().numpy()
+        }
+    elif isinstance(module, quantize.Conv2dQ):
+        return {
+            "type": "quantize.Conv2dQ",
+            "args": str(module),
+            "weight": module.weight.data.cpu().numpy(),
+            "bias": module.bias.data.cpu().numpy()
+        }
+    elif isinstance(module, quantize.BnActFused):
+        return {
+            "type": "quantize.BnActFused",
+            "args": str(module),
+            "weight": module.weight.data.cpu().numpy()
         }
     elif isinstance(module, nn.SiLU):
         return {
@@ -61,7 +74,6 @@ def save_model(module: nn.Module):
             "args": str(module)
         }
     elif isinstance(module, nn.Upsample):
-
         return {
             "type": "nn.Upsample",
             "args": "Upsample(scale_factor={},mode=\'{}\')".format(module.scale_factor, module.mode)

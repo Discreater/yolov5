@@ -30,11 +30,12 @@ def DWConv(c1, c2, k=1, s=1, act=True):
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, first_layer=False):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True,
+                 first_layer=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
         self.first_layer = first_layer
-        a_bits = 4 if not first_layer else 8
-        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, w_bits=4, w_signed=True)
+        a_bits = 8 if not first_layer else 8
+        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, w_bits=8, w_signed=True)
         self.bn = nn.BatchNorm2d(c2)
         # self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
         self.act = quantize.ActivationQuantize(a_bits=a_bits, scale_shift=4)  # -> (0,1)
@@ -45,8 +46,35 @@ class Conv(nn.Module):
         x = self.act(x)
         return x
 
-    def fuseforward(self, x):
+    def fused_forward(self, x):
         return self.act(self.conv(x))
+
+    def fuse(self):
+        conv_weight = quantize.quantize_weight(self.conv.weight.detach(), bits=self.conv.w_bits)
+        self.conv.weight.int().copy(conv_weight)
+
+        # fuse, quantize bn and act
+        gamma = self.bn.weight.detach()
+        beta = self.bn.bias.detach()
+        running_mean = self.bn.running_mean.detach()
+        running_var = self.bn.running_var.detach()
+        eps = self.bn.eps
+
+        in_bit = 4 if not self.first_layer else 8
+        out_bit = 4
+
+        inc, bias = quantize.quantize_bn(gamma, beta, running_mean, running_var, eps, w_bit=self.conv.w_bits,
+                                         in_bit=in_bit, out_bit=out_bit, scale_shift=self.act.scale_shift)
+
+        self.act = quantize.BnActFused(self.conv.out_channels, self.conv.w_bits, in_bit=in_bit, out_bit=out_bit,
+                                       scale_shift=self.act.scale_shift)
+        self.act.weight = inc
+        self.act.bias = bias
+
+        # change forward behavior
+        self.conv.forward = self.conv.fused_forward
+        self.forward = self.fused_forward
+        pass
 
 
 class Bottleneck(nn.Module):

@@ -175,9 +175,6 @@ def fuse_conv_and_bn(m):
     conv = m.conv
     bn = m.bn
     # Fuse convolution and batchnorm layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/
-    if isinstance(conv, quantize.Conv2dQ):
-        fuse_quantized_conv_and_bn(m)
-        return
     fused_conv = nn.Conv2d(conv.in_channels,
                            conv.out_channels,
                            kernel_size=conv.kernel_size,
@@ -198,46 +195,7 @@ def fuse_conv_and_bn(m):
 
     m.conv = fused_conv
     delattr(m, 'bn')  # remove batchnorm
-    m.forward = m.fuseforward  # update forward
-
-
-def fuse_quantized_conv_and_bn(m):
-    conv = m.conv
-    bn = m.bn
-    fused_conv = quantize.Conv2dQ(conv.in_channels,
-                                  conv.out_channels,
-                                  kernel_size=conv.kernel_size,
-                                  stride=conv.stride,
-                                  padding=conv.padding,
-                                  groups=conv.groups,
-                                  bias=True,
-                                  w_bits=conv.bits).requires_grad_(False).to(conv.weight.device)
-
-    w_conv = quantize.quantize_weight(conv.weight.clone(), bits=conv.w_bits)
-    fused_conv.weight.int().copy_(w_conv)
-
-    gamma = bn.weight.detach()
-    beta = bn.weight.bias.detach()
-    running_mean = bn.running_mean.detach()
-    running_var = bn.running_var.detach()
-    eps = bn.eps
-
-    in_bit = 4 if not m.first_layer else 8
-    out_bit = 4
-
-    inc, bias = quantize.quantize_bn(gamma, beta, running_mean, running_var, eps, w_bit=conv.w_bits, in_bit=in_bit,
-                                     out_bit=out_bit,
-                                     scale_shift=m.act.scale_shift)
-
-    act = quantize.FusedBnAct(conv.out_channels, w_bit=conv.w_bits, data_bit=in_bit, scale_shift=m.act.scale_shift)
-    act.weight.int().copy_(inc)
-    act.bias.int().copy_(bias)
-
-    m.conv = fused_conv
-    m.act = act
-    delattr(m, 'bn')  # remove batchnorm
-    m.forward = m.fuseforward  # update forward
-
+    m.forward = m.fused_forward  # update forward
 
 def model_info(model, verbose=False, img_size=640):
     # Model information. img_size may be int or list, i.e. img_size=640 or img_size=[640, 320]
