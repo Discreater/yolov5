@@ -30,15 +30,20 @@ def DWConv(c1, c2, k=1, s=1, act=True):
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, first_layer=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
+        self.first_layer = first_layer
+        a_bits = 4 if not first_layer else 8
         self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, w_bits=4, w_signed=True)
         self.bn = nn.BatchNorm2d(c2)
         # self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        self.act = quantize.ActivationQuantize(a_bits=4, scale=1, l_shift=4)  # -> (0,1)
+        self.act = quantize.ActivationQuantize(a_bits=a_bits, scale_shift=4)  # -> (0,1)
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
 
     def fuseforward(self, x):
         return self.act(self.conv(x))
@@ -109,7 +114,7 @@ class Focus(nn.Module):
     # Focus wh information into c-space
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Focus, self).__init__()
-        self.conv = Conv(c1 * 4, c2, k, s, p, g, act)
+        self.conv = Conv(c1 * 4, c2, k, s, p, g, act, first_layer=True)
         # self.contract = Contract(gain=2)
 
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)

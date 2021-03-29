@@ -425,7 +425,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                           imgsz=imgsz_test,
                                           conf_thres=0.001,
                                           iou_thres=0.7,
-                                          model=attempt_load(m, device).half(),
+                                          model=attempt_load(m, device, fuse=opt.not_fuse_test).half(),
                                           single_cls=opt.single_cls,
                                           dataloader=testloader,
                                           save_dir=save_dir,
@@ -474,6 +474,7 @@ if __name__ == '__main__':
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
     parser.add_argument('--no-wandb', action='store_true', help='do not use wandb')
+    parser.add_argument('--not-fuse-test', action='store_true', help='do not fuse conv when test')
     opt = parser.parse_args()
 
     # Set DDP variables

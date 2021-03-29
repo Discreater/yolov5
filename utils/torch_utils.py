@@ -201,7 +201,7 @@ def fuse_conv_and_bn(m):
     m.forward = m.fuseforward  # update forward
 
 
-def fuse_quantized_conv_and_bn(m, first_layer=False, last_layer=False):
+def fuse_quantized_conv_and_bn(m):
     conv = m.conv
     bn = m.bn
     fused_conv = quantize.Conv2dQ(conv.in_channels,
@@ -222,14 +222,14 @@ def fuse_quantized_conv_and_bn(m, first_layer=False, last_layer=False):
     running_var = bn.running_var.detach()
     eps = bn.eps
 
-    in_bit = 4 if not first_layer else 8
-    out_bit = 4 if not last_layer else 32
+    in_bit = 4 if not m.first_layer else 8
+    out_bit = 4
 
     inc, bias = quantize.quantize_bn(gamma, beta, running_mean, running_var, eps, w_bit=conv.w_bits, in_bit=in_bit,
                                      out_bit=out_bit,
-                                     l_shift=m.act.l_shift)
+                                     scale_shift=m.act.scale_shift)
 
-    act = quantize.FusedBnAct(conv.out_channels, w_bit=conv.w_bits, data_bit=in_bit, l_shift=m.act.l_shift)
+    act = quantize.FusedBnAct(conv.out_channels, w_bit=conv.w_bits, data_bit=in_bit, scale_shift=m.act.scale_shift)
     act.weight.int().copy_(inc)
     act.bias.int().copy_(bias)
 
