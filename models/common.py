@@ -7,6 +7,7 @@ import numpy as np
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 
 from utils.datasets import letterbox
@@ -33,12 +34,74 @@ class Conv(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True,
                  first_conv=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
-        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, first_conv=first_conv)
+        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, first_conv=first_conv,
+                                     a_scale_bits=4)
         self.bn = nn.BatchNorm2d(c2)
         self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.first_bn = True
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        """
+        see https://arxiv.org/abs/1806.08342
+        """
+        if self.training:
+            bn_x = F.conv2d(
+                input=x,
+                weight=self.conv.weight,
+                bias=self.conv.bias,
+                stride=self.conv.stride,
+                padding=self.conv.padding,
+                dilation=self.conv.dilation,
+                groups=self.conv.groups
+            )
+            batch_mean = torch.mean(bn_x, dim=[0, 2, 3])
+            batch_var = torch.var(bn_x, dim=[0, 2, 3])
+            with torch.no_grad():
+                if self.first_bn:
+                    self.first_bn = False
+                    self.bn.running_mean.add_(batch_mean)
+                    self.bn.running_var.add(batch_var)
+                else:
+                    self.bn.running_mean.mul_(1 - self.bn.momentum).add_(batch_mean * self.bn.momentum)
+                    self.bn.running_var.mul_(1 - self.bn.momentum).add_(batch_var * self.bn.momentum)
+            # gamma * batch_mean / sqrt(batch_var + eps)
+            bias = self.bn.bias - self.bn.weight * batch_mean / torch.sqrt(batch_var + self.bn.eps)
+        else:
+            # gamma * running_mean / sqrt(running_var + eps)
+            bias = self.bn.bias - self.bn.weight * self.bn.running_mean / torch.sqrt(self.bn.running_var + self.bn.eps)
+        # gamma / sqrt(running_var + eps).
+        # Here use running var for both train and eval. It will be scaled back later if it is training.
+        # See https://arxiv.org/abs/1806.08342 Figure 9
+        weight = self.conv.weight * (self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)).view(-1, 1, 1, 1)
+        q_x = self.conv.act_quantizer(x) if not self.conv.first_conv else x
+        # quantize weight
+        q_weight = self.conv.weight_quantizer(weight)
+        if self.training:
+            x = F.conv2d(
+                input=q_x,
+                weight=q_weight,
+                bias=None,
+                stride=self.conv.stride,
+                padding=self.conv.padding,
+                dilation=self.conv.dilation,
+                groups=self.conv.groups
+            )
+            # scale: sqrt(running_var + eps) / sqrt(batch_var + eps)
+            # noinspection PyUnboundLocalVariable
+            scale = (torch.sqrt(self.bn.running_var + self.bn.eps) / torch.sqrt(batch_var + self.bn.eps))
+            x *= scale.view(1, -1, 1, 1)
+            x += bias.view(1, -1, 1, 1)
+        else:
+            x = F.conv2d(
+                input=q_x,
+                weight=q_weight,
+                bias=bias,
+                stride=self.conv.stride,
+                padding=self.conv.padding,
+                dilation=self.conv.dilation,
+                groups=self.conv.groups,
+            )
+        return self.act(x)
 
     def fused_forward(self, x):
         return self.act(self.conv(x))

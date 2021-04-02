@@ -151,6 +151,10 @@ def find_modules(model, mclass=nn.Conv2d):
     return [i for i, m in enumerate(model.module_list) if isinstance(m, mclass)]
 
 
+def get_modules(model, typ):
+    return [m for m in model.modules() if isinstance(m, typ)]
+
+
 def sparsity(model):
     # Return global model sparsity
     a, b = 0., 0.

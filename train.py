@@ -22,8 +22,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
+from models import common
 from models.experimental import attempt_load
 from models.yolo import Model
+from utils import torch_utils
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
@@ -80,6 +82,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
+        for conv in torch_utils.get_modules(model, common.Conv):
+            bn: nn.BatchNorm2d = conv.bn
+            bn.running_var.copy_(torch.zeros_like(bn.running_var))
+            bn.running_mean.copy_(torch.zeros_like(bn.running_mean))
+            conv.first_bn = True
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
