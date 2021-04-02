@@ -15,6 +15,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
+from models import quantize
+
 try:
     import thop  # for FLOPS computation
 except ImportError:
@@ -171,13 +173,26 @@ def prune(model, amount=0.3):
 
 def fuse_conv_and_bn(conv, bn):
     # Fuse convolution and batchnorm layers https://tehnokv.com/posts/fusing-batchnorm-and-conv/
-    fusedconv = nn.Conv2d(conv.in_channels,
-                          conv.out_channels,
-                          kernel_size=conv.kernel_size,
-                          stride=conv.stride,
-                          padding=conv.padding,
-                          groups=conv.groups,
-                          bias=True).requires_grad_(False).to(conv.weight.device)
+    if isinstance(conv, quantize.Conv2dQ):
+        fusedconv = quantize.Conv2dQ(conv.in_channels,
+                                     conv.out_channels,
+                                     kernel_size=conv.kernel_size,
+                                     stride=conv.stride,
+                                     padding=conv.padding,
+                                     groups=conv.groups,
+                                     bias=True,
+                                     first_conv=conv.first_conv,
+                                     a_bits=conv.act_quantizer.bits,
+                                     a_scale_bits=conv.act_quantizer.scale_bits,
+                                     w_bits=conv.weight_quantizer.bits).requires_grad_(False).to(conv.weight.device)
+    else:
+        fusedconv = nn.Conv2d(conv.in_channels,
+                              conv.out_channels,
+                              kernel_size=conv.kernel_size,
+                              stride=conv.stride,
+                              padding=conv.padding,
+                              groups=conv.groups,
+                              bias=True).requires_grad_(False).to(conv.weight.device)
 
     # prepare filters
     w_conv = conv.weight.clone().view(conv.out_channels, -1)

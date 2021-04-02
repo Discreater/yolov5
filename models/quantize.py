@@ -4,6 +4,22 @@ import torch.nn.functional as F
 from torch.autograd import Function
 
 
+class DorefaQuantize(Function):
+
+    @staticmethod
+    def forward(ctx, x, bits):
+        scale = float(2 ** bits - 1)
+        x = x * scale
+        x = torch.round(x)
+        x = x / scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = grad_output.clone()
+        return grad_input, None
+
+
 class Conv2dQ(nn.Conv2d):
     def __init__(
             self,
@@ -17,6 +33,9 @@ class Conv2dQ(nn.Conv2d):
             bias=True,
             padding_mode: str = "zeros",
 
+            first_conv=False,
+            a_bits=8,
+            a_scale_bits=3,
             w_bits=8
     ):
         super().__init__(
@@ -30,11 +49,19 @@ class Conv2dQ(nn.Conv2d):
             bias=bias,
             padding_mode=padding_mode,
         )
+        self.first_conv = first_conv
+        self.act_quantizer = ActivationQuantize(bits=a_bits, scale_bits=a_scale_bits)
         self.weight_quantizer = WeightQuantize(bits=w_bits)
 
+    def extra_repr(self) -> str:
+        s = super(Conv2dQ, self).extra_repr()
+        s += ', first_conv={}'.format(self.first_conv)
+        return s
+
     def forward(self, x):
+        if self.first_conv:
+            x = self.act_quantizer(x)
         q_weight = self.weight_quantizer(self.weight)
-        # 量化卷积
         output = F.conv2d(
             input=x,
             weight=q_weight,
@@ -110,32 +137,6 @@ class ConvBnReLU2dQ(Conv2dQ):
         x = self.act_quantizer(x)
         return x
 
-    def fuse(self):
-        running_var = self.bn.running_var
-        running_mean = self.bn.running_mean
-
-        w_bn = self.bn.weight / (torch.sqrt(running_var + self.bn.eps))
-        weight = self.weight * w_bn.view(-1, 1, 1, 1)
-        weight = self.weight_quantizer(weight)
-        self.weight = weight
-
-        b_bn = self.bn.bias - self.bn.weight * running_mean / (torch.sqrt(running_var + self.bn.eps))
-        self.bias = b_bn
-        self.forward = self.fused_forward
-
-    def fused_forward(self, x):
-        x = F.conv2d(
-            input=x,
-            weight=self.weight,
-            bias=self.bias,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=self.groups
-        )
-        x = self.act_quantizer(x)
-        return x
-
 
 class WeightQuantize(nn.Module):
     def __init__(self, bits):
@@ -146,24 +147,17 @@ class WeightQuantize(nn.Module):
         s = "bits={}".format(self.bits)
         return s
 
-    def round(self, x):
-        output = Round.apply(x)
-        return output
-
     def forward(self, x):
         assert self.bits != 1, '！Binary quantization is not supported ！'
         if self.bits == 32:
-            output = x
+            x = x
         else:
             # 按照公式9和10计算
-            output = torch.tanh(x)
-            output = output / 2 / torch.max(torch.abs(output)) + 0.5  # 归一化-[0,1]
-            scale = float(2 ** self.bits - 1)
-            output = output * scale
-            output = self.round(output)
-            output = output / scale
-            output = 2 * output - 1
-        return output
+            x = torch.tanh(x)
+            x = x / torch.max(torch.abs(x)) * 0.5 + 0.5  # 归一化-[0,1]
+            x = DorefaQuantize.apply(x, self.bits)
+            x = 2 * x - 1
+        return x
 
 
 class ActivationQuantize(nn.Module):
@@ -176,31 +170,10 @@ class ActivationQuantize(nn.Module):
         s = "bits={}, scale_bits={}".format(self.bits, self.scale_bits)
         return s
 
-    def round(self, x):
-        output = Round.apply(x)
-        return output
-
     def forward(self, x):
         assert self.bits != 1, '！Binary quantization is not supported ！'
         if self.bits == 32:
-            output = x
+            return x
         else:
-            output = torch.clamp(x / (1 << self.scale_bits), 0, 1)  # 特征A截断前先进行缩放 >> scale_shift，以减小截断误差
-            scale = float(2 ** self.bits - 1)
-            output = output * scale
-            output = self.round(output)
-            output = output / scale
-        return output
-
-
-class Round(Function):
-
-    @staticmethod
-    def forward(self, x):
-        output = torch.round(x)
-        return output
-
-    @staticmethod
-    def backward(self, grad_output):
-        grad_input = grad_output.clone()
-        return grad_input
+            x = torch.clamp(x / float(1 << self.scale_bits), 0.0, 1.0)
+            return DorefaQuantize.apply(x, self.bits)

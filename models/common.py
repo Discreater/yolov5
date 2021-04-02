@@ -30,20 +30,18 @@ def DWConv(c1, c2, k=1, s=1, act=True):
 
 class Conv(nn.Module):
     # Standard convolution
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True,
+                 first_conv=False):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
-        # self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
-        # self.bn = nn.BatchNorm2d(c2)
-        # self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        self.conv_bn_relu = quantize.ConvBnReLU2dQ(c1, c2, k, s, autopad(k, p), groups=g, a_bits=8, a_scale_bits=0,
-                                                   w_bits=8, eps=1e-5,
-                                                   momentum=0.01)
+        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False, first_conv=first_conv)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
-        return self.conv_bn_relu(x)
+        return self.act(self.bn(self.conv(x)))
 
-    def fuse(self):
-        self.conv_bn_relu.fuse()
+    def fused_forward(self, x):
+        return self.act(self.conv(x))
 
 
 class Bottleneck(nn.Module):
@@ -111,7 +109,7 @@ class Focus(nn.Module):
     # Focus wh information into c-space
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Focus, self).__init__()
-        self.conv = Conv(c1 * 4, c2, k, s, p, g, act)
+        self.conv = Conv(c1 * 4, c2, k, s, p, g, act, first_conv=True)
         # self.contract = Contract(gain=2)
 
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
