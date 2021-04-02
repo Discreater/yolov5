@@ -110,13 +110,16 @@ class Ensemble(nn.ModuleList):
         return y, None  # inference, train output
 
 
-def attempt_load(weights, map_location=None):
+def attempt_load(weights, map_location=None, fuse=True):
     # Loads an ensemble of models weights=[a,b,c] or a single model weights=[a] or weights=a
     model = Ensemble()
     for w in weights if isinstance(weights, list) else [weights]:
         attempt_download(w)
         ckpt = torch.load(w, map_location=map_location)  # load
-        model.append(ckpt['ema' if ckpt.get('ema') else 'model'].float().fuse().eval())  # FP32 model
+        m = ckpt['ema' if ckpt.get('ema') else 'model'].float()
+        if fuse:
+            m = m.fuse()
+        model.append(m.eval())  # FP32 model
 
     # Compatibility updates
     for m in model.modules():

@@ -33,7 +33,7 @@ class Detect(nn.Module):
         a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
-        self.m = nn.ModuleList(quantize.Conv2dQ(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.m = nn.ModuleList(quantize.Conv2dQ(x, self.no * self.na, 1, w_bits=32) for x in ch)  # output conv
 
     def forward(self, x):
         # x = x.copy()  # for profiling
@@ -166,9 +166,10 @@ class Model(nn.Module):
         print('Fusing layers... ')
         for m in self.model.modules():
             if type(m) is Conv and hasattr(m, 'bn'):
-                m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
-                delattr(m, 'bn')  # remove batchnorm
-                m.forward = m.fuseforward  # update forward
+                m.fuse()
+                # m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                # delattr(m, 'bn')  # remove batchnorm
+                # m.forward = m.fuseforward  # update forward
         self.info()
         return self
 

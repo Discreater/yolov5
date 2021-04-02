@@ -32,15 +32,18 @@ class Conv(nn.Module):
     # Standard convolution
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Conv, self).__init__()
-        self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        # self.conv = quantize.Conv2dQ(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        # self.bn = nn.BatchNorm2d(c2)
+        # self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.conv_bn_relu = quantize.ConvBnReLU2dQ(c1, c2, k, s, autopad(k, p), groups=g, a_bits=8, a_scale_bits=0,
+                                                   w_bits=8, eps=1e-5,
+                                                   momentum=0.01)
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        return self.conv_bn_relu(x)
 
-    def fuseforward(self, x):
-        return self.act(self.conv(x))
+    def fuse(self):
+        self.conv_bn_relu.fuse()
 
 
 class Bottleneck(nn.Module):
@@ -279,7 +282,7 @@ class Detections:
     def print(self):
         self.display(pprint=True)  # print results
         print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' %
-              tuple(self.t))                      
+              tuple(self.t))
 
     def show(self):
         self.display(show=True)  # show results

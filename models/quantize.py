@@ -15,10 +15,9 @@ class Conv2dQ(nn.Conv2d):
             dilation=1,
             groups=1,
             bias=True,
-            padding_mode: str=  "zeros",
-            a_bits=8,
-            w_bits=8,
-            first_layer=False
+            padding_mode: str = "zeros",
+
+            w_bits=8
     ):
         super().__init__(
             in_channels=in_channels,
@@ -31,20 +30,13 @@ class Conv2dQ(nn.Conv2d):
             bias=bias,
             padding_mode=padding_mode,
         )
-        # 实例化调用A和W量化器
-        self.activation_quantizer = ActivationQuantize(a_bits=a_bits)
-        self.weight_quantizer = WeightQuantize(w_bits=w_bits)
-        self.first_layer = first_layer
+        self.weight_quantizer = WeightQuantize(bits=w_bits)
 
     def forward(self, x):
-        # 量化A和W
-        if not self.first_layer:
-            x = self.activation_quantizer(x)
-        q_input = x
         q_weight = self.weight_quantizer(self.weight)
         # 量化卷积
         output = F.conv2d(
-            input=q_input,
+            input=x,
             weight=q_weight,
             bias=self.bias,
             stride=self.stride,
@@ -55,24 +47,118 @@ class Conv2dQ(nn.Conv2d):
         return output
 
 
+class ConvBnReLU2dQ(Conv2dQ):
+    """
+    see https://arxiv.org/abs/1806.08342
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 a_bits=8,
+                 a_scale_bits=4,
+                 w_bits=8,
+                 eps=1e-5,
+                 momentum=0.01):
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
+                         bias=False, padding_mode="zeros", w_bits=w_bits)
+        self.bn = nn.BatchNorm2d(out_channels, eps, momentum)
+        self.act_quantizer = ActivationQuantize(bits=a_bits, scale_bits=a_scale_bits)
+
+    def forward(self, x):
+        conv_res = F.conv2d(
+            input=x,
+            weight=self.weight,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
+        )
+        batch_mean = torch.mean(conv_res, dim=[0, 2, 3])
+        batch_var = torch.var(conv_res, dim=[0, 2, 3])
+        _ = self.bn(conv_res)
+
+        # gamma / sqrt(running_var + eps). Here use running var, and it will be scaled back later.
+        # See https://arxiv.org/abs/1806.08342 Figure 9
+        weight = self.weight * (self.bn.weight / torch.sqrt(self.bn.running_var + self.bn.eps)).view(-1, 1, 1, 1)
+        # gamma / sqrt(batch_var + eps)
+        bias = (self.bn.bias - (self.bn.weight * batch_mean) / torch.sqrt(batch_var + self.bn.eps)).view(-1)
+
+        # quantize weight
+        weight = self.weight_quantizer(weight)
+
+        # scale: sqrt(running_var + eps) / sqrt(batch_var + eps)
+        scale = torch.sqrt((self.bn.running_var + self.bn.eps) / (batch_var + self.bn.eps))
+        bias = bias / scale
+
+        x = F.conv2d(
+            input=x,
+            weight=weight,
+            bias=bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
+        )
+        x *= scale.view(1, -1, 1, 1)
+        x = self.act_quantizer(x)
+        return x
+
+    def fuse(self):
+        running_var = self.bn.running_var
+        running_mean = self.bn.running_mean
+
+        w_bn = self.bn.weight / (torch.sqrt(running_var + self.bn.eps))
+        weight = self.weight * w_bn.view(-1, 1, 1, 1)
+        weight = self.weight_quantizer(weight)
+        self.weight = weight
+
+        b_bn = self.bn.bias - self.bn.weight * running_mean / (torch.sqrt(running_var + self.bn.eps))
+        self.bias = b_bn
+        self.forward = self.fused_forward
+
+    def fused_forward(self, x):
+        x = F.conv2d(
+            input=x,
+            weight=self.weight,
+            bias=self.bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
+        )
+        x = self.act_quantizer(x)
+        return x
+
+
 class WeightQuantize(nn.Module):
-    def __init__(self, w_bits):
+    def __init__(self, bits):
         super().__init__()
-        self.w_bits = w_bits
+        self.bits = bits
+
+    def extra_repr(self) -> str:
+        s = "bits={}".format(self.bits)
+        return s
 
     def round(self, x):
         output = Round.apply(x)
         return output
 
     def forward(self, x):
-        assert self.w_bits != 1, '！Binary quantization is not supported ！'
-        if self.w_bits == 32:
+        assert self.bits != 1, '！Binary quantization is not supported ！'
+        if self.bits == 32:
             output = x
         else:
             # 按照公式9和10计算
             output = torch.tanh(x)
             output = output / 2 / torch.max(torch.abs(output)) + 0.5  # 归一化-[0,1]
-            scale = float(2 ** self.w_bits - 1)
+            scale = float(2 ** self.bits - 1)
             output = output * scale
             output = self.round(output)
             output = output / scale
@@ -81,21 +167,26 @@ class WeightQuantize(nn.Module):
 
 
 class ActivationQuantize(nn.Module):
-    def __init__(self, a_bits):
+    def __init__(self, bits, scale_bits):
         super().__init__()
-        self.a_bits = a_bits
+        self.bits = bits
+        self.scale_bits = scale_bits
+
+    def extra_repr(self) -> str:
+        s = "bits={}, scale_bits={}".format(self.bits, self.scale_bits)
+        return s
 
     def round(self, x):
         output = Round.apply(x)
         return output
 
     def forward(self, x):
-        assert self.a_bits != 1, '！Binary quantization is not supported ！'
-        if self.a_bits == 32:
+        assert self.bits != 1, '！Binary quantization is not supported ！'
+        if self.bits == 32:
             output = x
         else:
-            output = torch.clamp(x * 0.1, 0, 1)  # 特征A截断前先进行缩放（* 0.1），以减小截断误差
-            scale = float(2 ** self.a_bits - 1)
+            output = torch.clamp(x / (1 << self.scale_bits), 0, 1)  # 特征A截断前先进行缩放 >> scale_shift，以减小截断误差
+            scale = float(2 ** self.bits - 1)
             output = output * scale
             output = self.round(output)
             output = output / scale
