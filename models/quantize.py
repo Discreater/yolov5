@@ -59,7 +59,7 @@ class Conv2dQ(nn.Conv2d):
         return s
 
     def forward(self, x):
-        if self.first_conv:
+        if not self.first_conv:
             x = self.act_quantizer(x)
         q_weight = self.weight_quantizer(self.weight)
         output = F.conv2d(
