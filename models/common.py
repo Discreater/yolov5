@@ -147,6 +147,37 @@ class C3SPP(C3):
         self.m = SPP(c_, c_, k)
 
 
+class ResUnit(nn.Module):
+    """
+    For yolo v4 tiny
+    """
+
+    def __init__(self, c_in, ch, groups=2, group_id=1):
+        super(ResUnit, self).__init__()
+        assert c_in == ch
+
+        self.groups = groups
+        self.group_id = group_id
+
+        c_ = c_in // groups
+
+        self.cv1 = Conv(c_, c_, 3, 1)
+        self.cv2 = Conv(c_, c_, 3, 1)
+
+        self.cv3 = Conv(ch, ch, 1, 1)
+
+    def forward(self, x):
+        groups = self.groups
+        group_id = self.group_id
+        _, b, _, _ = x.shape
+        x = x[:, b // groups * group_id:b // groups * (group_id + 1)]
+
+        cv1 = self.cv1(x)
+        cv2 = self.cv2(x)
+        r = torch.cat([cv1, cv2])
+        cv3 = self.cv3(r)
+        return cv3
+
 class SPP(nn.Module):
     # Spatial pyramid pooling layer used in YOLOv3-SPP
     def __init__(self, c1, c2, k=(5, 9, 13)):
