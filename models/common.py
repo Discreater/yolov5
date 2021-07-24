@@ -174,7 +174,7 @@ class ResUnit(nn.Module):
 
         cv1 = self.cv1(x)
         cv2 = self.cv2(x)
-        r = torch.cat([cv1, cv2])
+        r = torch.cat([cv1, cv2], 1)
         cv3 = self.cv3(r)
         return cv3
 
